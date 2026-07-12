@@ -1,6 +1,8 @@
+
 .env
-langgraph_env2/
-.venv/
+.streamlit/secrets.toml
 __pycache__/
 *.pyc
-*.logtravel_plans/
+.venv/
+venv/
+langgraph_env2/

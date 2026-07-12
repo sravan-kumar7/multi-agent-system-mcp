@@ -44,21 +44,43 @@ logger = logging.getLogger("travel_graph")
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env", override=False)
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
-
-if not GROQ_API_KEY:
-    raise ValueError(
-        "GROQ_API_KEY is missing. Add it to your local .env file or "
-        "Streamlit Community Cloud secrets."
-    )
-
-llm = ChatGroq(
-    model=GROQ_MODEL,
-    api_key=GROQ_API_KEY,
-    temperature=0.2,
-    max_retries=2,
+GROQ_MODEL = os.getenv(
+    "GROQ_MODEL",
+    "llama-3.3-70b-versatile",
 )
+
+_llm: ChatGroq | None = None
+
+
+def get_llm() -> ChatGroq:
+    """
+    Create the Groq client lazily.
+
+    Lazy initialization prevents the entire Streamlit app from crashing during
+    module import when a deployment secret is missing or temporarily unavailable.
+    Agent-level fallback handling can then return a useful travel plan.
+    """
+    global _llm
+
+    if _llm is not None:
+        return _llm
+
+    api_key = os.getenv("GROQ_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError(
+            "GROQ_API_KEY is not configured. Add it to Streamlit Community "
+            "Cloud secrets or the local .env file."
+        )
+
+    model_name = os.getenv("GROQ_MODEL", GROQ_MODEL).strip() or GROQ_MODEL
+
+    _llm = ChatGroq(
+        model=model_name,
+        api_key=api_key,
+        temperature=0.2,
+        max_retries=2,
+    )
+    return _llm
 
 
 # =============================================================================
@@ -279,7 +301,7 @@ async def invoke_llm_markdown(
 ) -> str:
     """Call Groq safely and require a non-empty Markdown response."""
     response = await asyncio.wait_for(
-        llm.ainvoke(
+        get_llm().ainvoke(
             [
                 SystemMessage(content=system_prompt),
                 HumanMessage(content=user_prompt),
@@ -1564,7 +1586,7 @@ async def hotel_agent(state: TravelState) -> dict[str, Any]:
             for item in search_results[:8]
         ]
 
-        response = await llm.ainvoke(
+        response = await get_llm().ainvoke(
             [
                 SystemMessage(
                     content=(
