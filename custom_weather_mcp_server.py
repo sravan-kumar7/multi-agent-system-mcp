@@ -1,22 +1,8 @@
-"""
-Custom OpenWeather MCP Server
-
-Features:
-- Worldwide city support
-- Current weather
-- Five-entry forecast
-- Clean Markdown output
-- Async HTTP requests
-- API-key validation
-- Timeout and network error handling
-- Friendly error messages
-- Streamlit Cloud and local deployment compatibility
-"""
-
 from __future__ import annotations
 
 import os
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -24,157 +10,163 @@ from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
 
 
-# =============================================================================
-# Environment configuration
-# =============================================================================
+BASE_DIR = Path(__file__).resolve().parent
+ENV_FILE = BASE_DIR / ".env"
 
-load_dotenv(override=False)
-
-OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")
 OPENWEATHER_BASE_URL = "https://api.openweathermap.org/data/2.5"
-REQUEST_TIMEOUT_SECONDS = 15.0
+REQUEST_TIMEOUT_SECONDS = 20.0
 
-
-# =============================================================================
-# MCP server
-# =============================================================================
+load_dotenv(ENV_FILE, override=False)
 
 mcp = FastMCP("Worldwide Weather Server")
 
 
-# =============================================================================
-# Helper functions
-# =============================================================================
+def get_environment_value(*names: str) -> str | None:
+    """Return the first non-empty environment variable."""
+    for name in names:
+        value = os.getenv(name)
+        if value and value.strip():
+            return value.strip()
+    return None
+
+
+def get_openweather_api_key() -> str | None:
+    """Return the OpenWeather API key using supported aliases."""
+    return get_environment_value(
+        "OPENWEATHER_API_KEY",
+        "OPEN_WEATHER_API_KEY",
+    )
+
 
 def validate_api_key() -> str | None:
-    """
-    Return a readable error when the OpenWeather API key is missing.
-    """
-
-    if OPENWEATHER_API_KEY:
+    """Return safe Markdown when the OpenWeather key is unavailable."""
+    if get_openweather_api_key():
         return None
 
     return (
         "## ⚠️ Weather service is not configured\n\n"
-        "The `OPENWEATHER_API_KEY` environment variable is missing.\n\n"
-        "Add the key to your local `.env` file or Streamlit Cloud secrets."
+        "The OpenWeather API key is missing.\n\n"
+        "Add `OPENWEATHER_API_KEY` to the local `.env` file or "
+        "Streamlit Community Cloud secrets."
     )
 
 
-def normalize_city(city: str) -> str:
-    """
-    Clean and validate a city or worldwide location supplied by the agent.
-    """
+def first_non_empty(*values: str | None) -> str:
+    """Return the first non-empty location candidate."""
+    for value in values:
+        if value and value.strip():
+            return value.strip()
+    return ""
 
-    cleaned_city = " ".join(city.strip().split())
 
-    if not cleaned_city:
+def normalize_location(
+    *,
+    city: str = "",
+    location: str = "",
+    place: str = "",
+    destination: str = "",
+    city_name: str = "",
+    location_name: str = "",
+    query: str = "",
+) -> str:
+    """
+    Select and normalize a location.
+
+    Specific fields are preferred before the generic query field.
+    The caller must pass only a normalized destination in query.
+    """
+    selected = first_non_empty(
+        location,
+        city,
+        place,
+        destination,
+        city_name,
+        location_name,
+        query,
+    )
+
+    cleaned = " ".join(selected.split())
+
+    if not cleaned:
         raise ValueError(
-            "Please provide a city, such as `Tokyo, Japan` or "
+            "Provide a location such as `Tokyo, Japan` or "
             "`London, United Kingdom`."
         )
 
-    if len(cleaned_city) > 150:
-        raise ValueError("The supplied location is too long.")
+    if len(cleaned) > 120:
+        raise ValueError(
+            "The supplied location is too long. Send only the city or "
+            "city-and-country name."
+        )
 
-    return cleaned_city
+    return cleaned
 
 
-def format_number(value: Any, decimal_places: int = 1) -> str:
-    """
-    Safely format API numeric values.
-    """
-
+def format_number(value: Any, decimal_places: int = 1) -> str | None:
+    """Safely format numeric values, returning None when invalid."""
     try:
         number = round(float(value), decimal_places)
-
-        if number.is_integer():
-            return str(int(number))
-
-        return str(number)
-
     except (TypeError, ValueError):
-        return "Not available"
+        return None
+
+    if number.is_integer():
+        return str(int(number))
+
+    return str(number)
+
+
+def readable_condition(value: Any) -> str | None:
+    """Return a clean human-readable weather condition."""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    return text[:1].upper() + text[1:]
 
 
 def weather_icon(condition: str) -> str:
-    """
-    Return an emoji suitable for an OpenWeather condition.
-    """
-
+    """Return an emoji suitable for a weather condition."""
     normalized = condition.lower()
 
     if "thunder" in normalized:
         return "⛈️"
-
     if "rain" in normalized or "drizzle" in normalized:
         return "🌧️"
-
     if "snow" in normalized:
         return "❄️"
-
     if "clear" in normalized:
         return "☀️"
-
     if "cloud" in normalized or "overcast" in normalized:
         return "☁️"
-
-    if (
-        "mist" in normalized
-        or "fog" in normalized
-        or "haze" in normalized
-        or "smoke" in normalized
+    if any(
+        item in normalized
+        for item in ("mist", "fog", "haze", "smoke")
     ):
         return "🌫️"
 
     return "🌤️"
 
 
-def readable_condition(condition: Any) -> str:
-    """
-    Convert conditions such as 'overcast clouds' into 'Overcast clouds'.
-    """
-
-    text = str(condition or "Not available").strip()
-
-    if not text:
-        return "Not available"
-
-    return text[0].upper() + text[1:]
-
-
-def format_forecast_datetime(value: str) -> str:
-    """
-    Convert OpenWeather's date format into a human-readable label.
-
-    Example:
-    2026-07-11 15:00:00 -> 11 Jul, 03:00 PM
-    """
+def format_forecast_datetime(value: Any) -> str:
+    """Convert an OpenWeather forecast timestamp to a readable label."""
+    text = str(value or "").strip()
 
     try:
-        parsed = datetime.strptime(
-            value,
-            "%Y-%m-%d %H:%M:%S",
-        )
-
+        parsed = datetime.strptime(text, "%Y-%m-%d %H:%M:%S")
         return parsed.strftime("%d %b, %I:%M %p")
-
-    except (TypeError, ValueError):
-        return str(value)
+    except ValueError:
+        return text or "Upcoming period"
 
 
 def create_weather_advice(
+    *,
     temperature: Any,
     humidity: Any,
     condition: str,
     wind_speed: Any,
 ) -> list[str]:
-    """
-    Generate practical advice using only returned weather values.
-    """
-
+    """Generate practical traveller advice from live measurements."""
     advice: list[str] = []
-    normalized_condition = condition.lower()
+    normalized = condition.lower()
 
     try:
         temperature_value = float(temperature)
@@ -191,18 +183,18 @@ def create_weather_advice(
     except (TypeError, ValueError):
         wind_value = None
 
-    if "rain" in normalized_condition or "drizzle" in normalized_condition:
+    if "rain" in normalized or "drizzle" in normalized:
         advice.append(
             "Carry a compact umbrella or lightweight waterproof jacket."
         )
 
-    if "thunder" in normalized_condition:
+    if "thunder" in normalized:
         advice.append(
-            "Avoid exposed outdoor areas during thunderstorms and "
-            "keep an indoor backup plan."
+            "Keep an indoor alternative and avoid exposed outdoor areas "
+            "during thunderstorms."
         )
 
-    if "snow" in normalized_condition:
+    if "snow" in normalized:
         advice.append(
             "Wear insulated footwear and allow extra travel time."
         )
@@ -212,25 +204,20 @@ def create_weather_advice(
             advice.append(
                 "Wear breathable clothing, use sunscreen and stay hydrated."
             )
-
         elif temperature_value >= 24:
             advice.append(
                 "Light, breathable clothing should be comfortable."
             )
-
         elif temperature_value <= 10:
             advice.append(
                 "Pack warm layers, especially for mornings and evenings."
             )
-
         elif temperature_value <= 18:
-            advice.append(
-                "Carry a light jacket or sweater."
-            )
+            advice.append("Carry a light jacket or sweater.")
 
     if humidity_value is not None and humidity_value >= 70:
         advice.append(
-            "Humidity is high, so plan short breaks and carry drinking water."
+            "High humidity is expected, so carry water and plan short breaks."
         )
 
     if wind_value is not None and wind_value >= 10:
@@ -240,80 +227,70 @@ def create_weather_advice(
 
     if not advice:
         advice.append(
-            "Conditions appear manageable, but check the forecast again "
-            "before outdoor activities."
+            "Conditions appear manageable, but recheck before outdoor plans."
         )
 
     return advice
 
 
 def openweather_error_message(
+    *,
     status_code: int,
     payload: Any,
-    city: str,
+    location: str,
 ) -> str:
-    """
-    Convert OpenWeather errors into readable Markdown.
-    """
-
-    message = ""
-
+    """Convert OpenWeather errors into safe traveller-facing Markdown."""
+    api_message = ""
     if isinstance(payload, dict):
-        message = str(payload.get("message", "")).strip()
+        api_message = str(payload.get("message", "") or "").strip()
 
     if status_code == 401:
         explanation = (
-            "The OpenWeather API key is invalid, inactive or not yet activated."
+            "The OpenWeather API key is invalid, inactive, or still awaiting "
+            "activation."
         )
-
     elif status_code == 404:
         explanation = (
-            f"The location **{city}** could not be found. "
-            "Try a more specific value such as `Tokyo, Japan`."
+            f"The location **{location}** could not be found. Try a more "
+            "specific destination such as `Tokyo, Japan`."
         )
-
     elif status_code == 429:
         explanation = (
-            "The OpenWeather request limit has been reached. "
-            "Please wait and try again."
+            "The OpenWeather request limit has been reached. Try again later."
         )
-
     elif status_code >= 500:
         explanation = (
-            "OpenWeather is temporarily unavailable. Please try again shortly."
+            "OpenWeather is temporarily unavailable. Try again shortly."
         )
-
     else:
-        explanation = message or "The weather request could not be completed."
+        explanation = api_message or (
+            "The weather request could not be completed."
+        )
 
     return (
         "## ⚠️ Weather information unavailable\n\n"
         f"{explanation}\n\n"
-        f"**Requested location:** {city}"
+        f"**Requested location:** {location}"
     )
 
 
 async def request_openweather(
+    *,
     endpoint: str,
-    city: str,
+    location: str,
 ) -> tuple[dict[str, Any] | None, str | None]:
-    """
-    Make an asynchronous request to OpenWeather.
-
-    Returns:
-        (response_data, error_markdown)
-    """
-
+    """Request OpenWeather data asynchronously."""
     api_key_error = validate_api_key()
-
     if api_key_error:
         return None, api_key_error
 
-    url = f"{OPENWEATHER_BASE_URL}/{endpoint}"
+    api_key = get_openweather_api_key()
+    if not api_key:
+        return None, api_key_error
 
     params = {
-        "q": city,
-        "appid": OPENWEATHER_API_KEY,
+        "q": location,
+        "appid": api_key,
         "units": "metric",
     }
 
@@ -323,15 +300,17 @@ async def request_openweather(
             connect=10.0,
         )
 
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        async with httpx.AsyncClient(
+            timeout=timeout,
+            follow_redirects=True,
+        ) as client:
             response = await client.get(
-                url,
+                f"{OPENWEATHER_BASE_URL}/{endpoint}",
                 params=params,
             )
 
         try:
             payload = response.json()
-
         except ValueError:
             payload = {}
 
@@ -339,9 +318,9 @@ async def request_openweather(
             return (
                 None,
                 openweather_error_message(
-                    response.status_code,
-                    payload,
-                    city,
+                    status_code=response.status_code,
+                    payload=payload,
+                    location=location,
                 ),
             )
 
@@ -350,7 +329,7 @@ async def request_openweather(
                 None,
                 (
                     "## ⚠️ Weather information unavailable\n\n"
-                    "OpenWeather returned an unexpected response format."
+                    "The weather provider returned an unexpected response."
                 ),
             )
 
@@ -361,114 +340,91 @@ async def request_openweather(
             None,
             (
                 "## ⏳ Weather request timed out\n\n"
-                "OpenWeather did not respond within the expected time. "
-                "Please try again."
+                "The weather provider did not respond in time. Try again."
             ),
         )
-
-    except httpx.RequestError as error:
+    except httpx.RequestError:
         return (
             None,
             (
-                "## 🌐 Weather service connection failed\n\n"
-                "The application could not connect to OpenWeather.\n\n"
-                f"**Technical reason:** {error}"
+                "## 🌐 Weather connection unavailable\n\n"
+                "The application could not connect to the weather provider. "
+                "Check the internet connection and try again."
             ),
         )
-
-    except Exception as error:
+    except Exception:
         return (
             None,
             (
-                "## ⚠️ Unexpected weather error\n\n"
-                "The weather request could not be completed.\n\n"
-                f"**Technical reason:** {error}"
+                "## ⚠️ Weather information unavailable\n\n"
+                "An unexpected weather-service error occurred. Try again."
             ),
         )
 
 
-# =============================================================================
-# MCP tools
-# =============================================================================
+def build_current_weather_markdown(
+    *,
+    requested_location: str,
+    data: dict[str, Any],
+) -> str:
+    """Build clean current-weather Markdown from OpenWeather data."""
+    main_data = data.get("main")
+    weather_data = data.get("weather")
+    wind_data = data.get("wind")
+    system_data = data.get("sys")
 
-@mcp.tool()
-async def get_current_weather(city: str) -> str:
-    """
-    Get current weather for any worldwide city or location.
+    main_data = main_data if isinstance(main_data, dict) else {}
+    wind_data = wind_data if isinstance(wind_data, dict) else {}
+    system_data = system_data if isinstance(system_data, dict) else {}
 
-    Examples:
-    - Tokyo, Japan
-    - London, United Kingdom
-    - New York, United States
-    - Dubai, United Arab Emirates
-    """
+    weather_entry: dict[str, Any] = {}
+    if isinstance(weather_data, list) and weather_data:
+        first_entry = weather_data[0]
+        if isinstance(first_entry, dict):
+            weather_entry = first_entry
 
-    try:
-        city = normalize_city(city)
-
-    except ValueError as error:
-        return (
-            "## ⚠️ Invalid weather location\n\n"
-            f"{error}"
-        )
-
-    data, error = await request_openweather(
-        endpoint="weather",
-        city=city,
-    )
-
-    if error:
-        return error
-
-    if not data:
-        return (
-            "## ⚠️ Weather information unavailable\n\n"
-            "No weather information was returned."
-        )
-
-    main_data = data.get("main", {})
-    weather_data = data.get("weather", [])
-    wind_data = data.get("wind", {})
-    system_data = data.get("sys", {})
-
-    weather_entry = (
-        weather_data[0]
-        if isinstance(weather_data, list) and weather_data
-        else {}
-    )
-
-    resolved_city = str(data.get("name") or city)
-
+    resolved_city = str(data.get("name") or requested_location).strip()
     country_code = str(system_data.get("country") or "").strip()
-
     display_location = (
         f"{resolved_city}, {country_code}"
         if country_code
         else resolved_city
     )
 
-    temperature = main_data.get("temp")
-    feels_like = main_data.get("feels_like")
-    humidity = main_data.get("humidity")
-    pressure = main_data.get("pressure")
-    condition = readable_condition(
-        weather_entry.get("description")
+    temperature = format_number(main_data.get("temp"))
+    feels_like = format_number(main_data.get("feels_like"))
+    humidity = format_number(main_data.get("humidity"), 0)
+    pressure = format_number(main_data.get("pressure"), 0)
+    wind_speed = format_number(wind_data.get("speed"))
+    condition = readable_condition(weather_entry.get("description"))
+
+    required_values = (
+        temperature,
+        feels_like,
+        humidity,
+        wind_speed,
+        condition,
     )
-    wind_speed = wind_data.get("speed")
+    if any(value is None for value in required_values):
+        return (
+            f"## 🌦️ Weather in {display_location}\n\n"
+            "Live weather was received, but the provider response did not "
+            "contain all required measurements.\n\n"
+            "Check an official weather source before departure."
+        )
 
     icon = weather_icon(condition)
-
     advice = create_weather_advice(
-        temperature=temperature,
-        humidity=humidity,
+        temperature=main_data.get("temp"),
+        humidity=main_data.get("humidity"),
         condition=condition,
-        wind_speed=wind_speed,
+        wind_speed=wind_data.get("speed"),
     )
+    advice_markdown = "\n".join(f"- {item}" for item in advice)
 
-    advice_markdown = "\n".join(
-        f"- {item}"
-        for item in advice
-    )
+    pressure_row = ""
+    if pressure is not None:
+        pressure_row = f"| 🧭 Air pressure | **{pressure} hPa** |\n"
 
     return f"""## {icon} Weather in {display_location}
 
@@ -476,39 +432,47 @@ async def get_current_weather(city: str) -> str:
 
 | Metric | Reading |
 |---|---|
-| 🌡️ Temperature | **{format_number(temperature)}°C** |
-| 🤗 Feels like | **{format_number(feels_like)}°C** |
+| 🌡️ Temperature | **{temperature}°C** |
+| 🤗 Feels like | **{feels_like}°C** |
 | {icon} Condition | **{condition}** |
-| 💧 Humidity | **{format_number(humidity, 0)}%** |
-| 💨 Wind speed | **{format_number(wind_speed)} m/s** |
-| 🧭 Air pressure | **{format_number(pressure, 0)} hPa** |
-
+| 💧 Humidity | **{humidity}%** |
+| 💨 Wind speed | **{wind_speed} m/s** |
+{pressure_row}
 ### 🎒 Traveller advice
 
 {advice_markdown}
 
-> Weather conditions may change. Check again shortly before outdoor activities.
+> Live weather can change. Recheck shortly before outdoor activities.
 """
 
 
 @mcp.tool()
-async def get_forecast(city: str) -> str:
-    """
-    Get the upcoming five forecast periods for any worldwide city.
-    """
-
+async def get_current_weather(
+    city: str = "",
+    location: str = "",
+    place: str = "",
+    destination: str = "",
+    city_name: str = "",
+    location_name: str = "",
+    query: str = "",
+) -> str:
+    """Get current weather for a normalized worldwide destination."""
     try:
-        city = normalize_city(city)
-
-    except ValueError as error:
-        return (
-            "## ⚠️ Invalid forecast location\n\n"
-            f"{error}"
+        normalized_location = normalize_location(
+            city=city,
+            location=location,
+            place=place,
+            destination=destination,
+            city_name=city_name,
+            location_name=location_name,
+            query=query,
         )
+    except ValueError as error:
+        return f"## ⚠️ Invalid weather location\n\n{error}"
 
     data, error = await request_openweather(
-        endpoint="forecast",
-        city=city,
+        endpoint="weather",
+        location=normalized_location,
     )
 
     if error:
@@ -516,113 +480,141 @@ async def get_forecast(city: str) -> str:
 
     if not data:
         return (
-            "## ⚠️ Forecast unavailable\n\n"
+            f"## 🌦️ Weather in {normalized_location}\n\n"
+            "No live weather information was returned."
+        )
+
+    return build_current_weather_markdown(
+        requested_location=normalized_location,
+        data=data,
+    )
+
+
+@mcp.tool()
+async def get_forecast(
+    city: str = "",
+    location: str = "",
+    place: str = "",
+    destination: str = "",
+    city_name: str = "",
+    location_name: str = "",
+    query: str = "",
+) -> str:
+    """Get the next five OpenWeather forecast periods."""
+    try:
+        normalized_location = normalize_location(
+            city=city,
+            location=location,
+            place=place,
+            destination=destination,
+            city_name=city_name,
+            location_name=location_name,
+            query=query,
+        )
+    except ValueError as error:
+        return f"## ⚠️ Invalid forecast location\n\n{error}"
+
+    data, error = await request_openweather(
+        endpoint="forecast",
+        location=normalized_location,
+    )
+
+    if error:
+        return error
+
+    if not data:
+        return (
+            f"## 📅 Forecast for {normalized_location}\n\n"
             "No forecast information was returned."
         )
 
-    city_data = data.get("city", {})
+    city_data = data.get("city")
+    city_data = city_data if isinstance(city_data, dict) else {}
 
     resolved_city = str(
-        city_data.get("name")
-        or city
-    )
-
-    country_code = str(
-        city_data.get("country")
-        or ""
+        city_data.get("name") or normalized_location
     ).strip()
-
+    country_code = str(city_data.get("country") or "").strip()
     display_location = (
         f"{resolved_city}, {country_code}"
         if country_code
         else resolved_city
     )
 
-    forecast_items = data.get("list", [])
-
+    forecast_items = data.get("list")
     if not isinstance(forecast_items, list) or not forecast_items:
         return (
-            f"## ⚠️ Forecast unavailable for {display_location}\n\n"
-            "OpenWeather returned no forecast periods."
+            f"## 📅 Forecast for {display_location}\n\n"
+            "The provider returned no usable forecast periods."
         )
 
-    table_rows: list[str] = []
+    rows: list[str] = []
     conditions_seen: list[str] = []
 
     for item in forecast_items[:5]:
         if not isinstance(item, dict):
             continue
 
-        main_data = item.get("main", {})
-        weather_data = item.get("weather", [])
+        main_data = item.get("main")
+        weather_data = item.get("weather")
+        main_data = main_data if isinstance(main_data, dict) else {}
 
-        weather_entry = (
-            weather_data[0]
-            if isinstance(weather_data, list) and weather_data
-            else {}
-        )
+        weather_entry: dict[str, Any] = {}
+        if isinstance(weather_data, list) and weather_data:
+            first_entry = weather_data[0]
+            if isinstance(first_entry, dict):
+                weather_entry = first_entry
 
-        timestamp = format_forecast_datetime(
-            str(item.get("dt_txt") or "")
-        )
-
-        temperature = main_data.get("temp")
-        feels_like = main_data.get("feels_like")
-
+        temperature = format_number(main_data.get("temp"))
+        feels_like = format_number(main_data.get("feels_like"))
         condition = readable_condition(
             weather_entry.get("description")
         )
 
+        if (
+            temperature is None
+            or feels_like is None
+            or condition is None
+        ):
+            continue
+
         conditions_seen.append(condition)
-
-        icon = weather_icon(condition)
-
-        table_rows.append(
-            f"| {timestamp} | "
-            f"**{format_number(temperature)}°C** | "
-            f"{format_number(feels_like)}°C | "
-            f"{icon} {condition} |"
+        rows.append(
+            f"| {format_forecast_datetime(item.get('dt_txt'))} | "
+            f"**{temperature}°C** | {feels_like}°C | "
+            f"{weather_icon(condition)} {condition} |"
         )
 
-    if not table_rows:
+    if not rows:
         return (
-            f"## ⚠️ Forecast unavailable for {display_location}\n\n"
-            "No usable forecast entries were returned."
+            f"## 📅 Forecast for {display_location}\n\n"
+            "The provider returned forecast data without usable measurements."
         )
 
     combined_conditions = " ".join(conditions_seen).lower()
-
     forecast_advice: list[str] = []
 
     if "rain" in combined_conditions or "drizzle" in combined_conditions:
         forecast_advice.append(
-            "Rain is expected during at least one forecast period. "
-            "Carry an umbrella."
+            "Rain appears in the forecast. Carry a compact umbrella."
         )
-
     if "thunder" in combined_conditions:
         forecast_advice.append(
-            "Thunderstorms may affect outdoor activities. "
-            "Keep an indoor backup plan."
+            "Keep an indoor backup plan for possible thunderstorms."
         )
-
     if "snow" in combined_conditions:
         forecast_advice.append(
-            "Snow may slow transport. Allow additional travel time."
+            "Allow extra travel time because snow may affect transport."
         )
-
     if not forecast_advice:
         forecast_advice.append(
-            "The upcoming conditions appear relatively stable, "
-            "but recheck before departure."
+            "Conditions appear relatively stable, but recheck before travel."
         )
 
-    forecast_advice_markdown = "\n".join(
-        f"- {item}"
-        for item in forecast_advice
+    rows_markdown = "\n".join(rows)
+    advice_markdown = "\n".join(
+        f"- {item}" for item in forecast_advice
     )
-
-    rows_markdown = "\n".join(table_rows)
 
     return f"""## 📅 Upcoming forecast for {display_location}
 
@@ -632,15 +624,11 @@ async def get_forecast(city: str) -> str:
 
 ### 🧳 Forecast-based advice
 
-{forecast_advice_markdown}
+{advice_markdown}
 
-> Forecast data is shown in the location's reported time sequence and may change.
+> Forecasts can change. Recheck shortly before departure.
 """
 
-
-# =============================================================================
-# Server entry point
-# =============================================================================
 
 if __name__ == "__main__":
     mcp.run()

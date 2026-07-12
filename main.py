@@ -8,6 +8,7 @@ import os
 import re
 import uuid
 from datetime import datetime
+from pathlib import Path
 from typing import Annotated, Any, Iterable, TypedDict
 from urllib.parse import urlparse
 
@@ -22,6 +23,7 @@ from langchain_groq import ChatGroq
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 
+from mcp_client import load_all_tools
 
 
 # =============================================================================
@@ -39,33 +41,24 @@ logger = logging.getLogger("travel_graph")
 # Environment and model configuration
 # =============================================================================
 
-load_dotenv(override=False)
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env", override=False)
 
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
-_llm: ChatGroq | None = None
 
-
-def get_llm() -> ChatGroq:
-    """Create the Groq client lazily so importing main.py never crashes."""
-    global _llm
-
-    if _llm is not None:
-        return _llm
-
-    api_key = os.getenv("GROQ_API_KEY")
-    if not api_key:
-        raise RuntimeError(
-            "GROQ_API_KEY is missing. Add it to your local .env file or "
-            "Streamlit Community Cloud secrets."
-        )
-
-    _llm = ChatGroq(
-        model=GROQ_MODEL,
-        api_key=api_key,
-        temperature=0.2,
-        max_retries=2,
+if not GROQ_API_KEY:
+    raise ValueError(
+        "GROQ_API_KEY is missing. Add it to your local .env file or "
+        "Streamlit Community Cloud secrets."
     )
-    return _llm
+
+llm = ChatGroq(
+    model=GROQ_MODEL,
+    api_key=GROQ_API_KEY,
+    temperature=0.2,
+    max_retries=2,
+)
 
 
 # =============================================================================
@@ -90,33 +83,20 @@ class TravelState(TypedDict, total=False):
 # =============================================================================
 
 _loaded_tool_data: dict[str, Any] | None = None
+_tool_lock = asyncio.Lock()
 
 
 async def get_agent_tools() -> dict[str, Any]:
-    """Load and cache MCP/search tools without import-time side effects.
-
-    Importing mcp_client lazily prevents the whole Streamlit application from
-    failing when an optional MCP dependency or server is unavailable.
-    """
+    """Load and cache all MCP/search tools once per Python process."""
     global _loaded_tool_data
 
     if _loaded_tool_data is not None:
         return _loaded_tool_data
 
-    try:
-        from mcp_client import load_all_tools
-
-        logger.info("Loading MCP and search tools...")
-        loaded = await load_all_tools()
-        _loaded_tool_data = loaded if isinstance(loaded, dict) else {}
-    except Exception as exc:
-        logger.exception("MCP/search tool loading failed")
-        _loaded_tool_data = {
-            "flight_tools": [],
-            "hotel_tools": [],
-            "weather_tools": [],
-            "tool_loading_error": str(exc),
-        }
+    async with _tool_lock:
+        if _loaded_tool_data is None:
+            logger.info("Loading MCP and search tools...")
+            _loaded_tool_data = await load_all_tools()
 
     return _loaded_tool_data
 
@@ -235,6 +215,214 @@ def normalize_tool_result(value: Any) -> Any:
     return value
 
 
+
+def extract_mcp_text(value: Any) -> str:
+    """
+    Extract clean Markdown/text from MCP and LangChain content blocks.
+
+    This prevents raw wrappers such as
+    ``[{"type": "text", "text": "..."}]`` from reaching Streamlit.
+    """
+    if value is None:
+        return ""
+
+    if hasattr(value, "content"):
+        return extract_mcp_text(getattr(value, "content"))
+
+    if isinstance(value, str):
+        return value.strip()
+
+    if isinstance(value, list):
+        parts = [extract_mcp_text(item) for item in value]
+        return "\n\n".join(part for part in parts if part).strip()
+
+    if isinstance(value, dict):
+        if value.get("type") == "text" and "text" in value:
+            return str(value.get("text", "")).strip()
+
+        if "text" in value:
+            return str(value.get("text", "")).strip()
+
+        if "content" in value:
+            return extract_mcp_text(value.get("content"))
+
+        try:
+            return json.dumps(
+                value,
+                ensure_ascii=False,
+                indent=2,
+                default=str,
+            )
+        except Exception:
+            return str(value).strip()
+
+    return str(value).strip()
+
+
+def looks_like_markdown(value: str) -> bool:
+    """Return True when a tool already returned ready-to-render Markdown."""
+    text = value.lstrip()
+    return (
+        text.startswith("#")
+        or "| Metric |" in text
+        or "| Date and time |" in text
+        or "### Current conditions" in text
+        or "### Upcoming forecast" in text
+    )
+
+
+async def invoke_llm_markdown(
+    system_prompt: str,
+    user_prompt: str,
+    *,
+    timeout_seconds: int = 90,
+) -> str:
+    """Call Groq safely and require a non-empty Markdown response."""
+    response = await asyncio.wait_for(
+        llm.ainvoke(
+            [
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=user_prompt),
+            ]
+        ),
+        timeout=timeout_seconds,
+    )
+
+    content = clean_markdown(response)
+
+    if not content:
+        raise RuntimeError("The language model returned an empty response.")
+
+    return content
+
+
+def extract_trip_duration(user_query: str, default: int = 5) -> int:
+    """Extract a sensible trip duration from the request."""
+    patterns = (
+        r"\b(\d{1,2})\s*[- ]?\s*day",
+        r"\bfor\s+(\d{1,2})\s+days?\b",
+    )
+
+    for pattern in patterns:
+        match = re.search(pattern, user_query, flags=re.IGNORECASE)
+        if match:
+            return max(1, min(int(match.group(1)), 30))
+
+    return default
+
+
+def build_fallback_itinerary(
+    destination: str,
+    user_query: str,
+) -> str:
+    """Create a useful itinerary even when the LLM provider is unavailable."""
+    days = extract_trip_duration(user_query)
+    day_templates = [
+        ("Arrival and orientation", "Check in, explore the local area and recover from travel."),
+        ("Signature landmarks", "Visit the destination's most important landmarks and central districts."),
+        ("Culture and history", "Explore museums, heritage areas, temples, monuments or historic neighbourhoods."),
+        ("Local experiences", "Try local food, markets, neighbourhood walks and community experiences."),
+        ("Nature or day trip", "Take a practical day trip or visit parks, viewpoints or nearby attractions."),
+        ("Shopping and leisure", "Keep a flexible day for shopping, cafés, entertainment and rest."),
+        ("Final highlights and departure", "Complete any missed activities, pack and travel to the airport early."),
+    ]
+
+    lines = [
+        f"## 🗺️ {days}-day plan for {destination}",
+        "",
+        "> This practical fallback itinerary was generated because final LLM "
+        "synthesis was temporarily unavailable. Confirm opening hours and bookings.",
+        "",
+    ]
+
+    for index in range(days):
+        title, detail = day_templates[min(index, len(day_templates) - 1)]
+
+        if index >= len(day_templates):
+            title = f"Flexible exploration day {index + 1}"
+            detail = (
+                "Choose activities based on weather, energy level and any attractions "
+                "that still need to be covered."
+            )
+
+        lines.extend(
+            [
+                f"### Day {index + 1} — {title}",
+                "",
+                f"- **Morning:** {detail}",
+                "- **Afternoon:** Continue with nearby attractions to minimise travel time.",
+                "- **Evening:** Enjoy local dining and keep the schedule flexible.",
+                "- **Transport:** Prefer public transport or official taxi services.",
+                "- **Tip:** Reserve timed-entry attractions in advance.",
+                "",
+            ]
+        )
+
+    lines.extend(
+        [
+            "## 💰 Budget guidance",
+            "",
+            "- Treat all prices as estimates until live booking pages are checked.",
+            "- Keep a 10–15% contingency for transport, taxes and unexpected costs.",
+            "",
+            "## 📄 Before travelling",
+            "",
+            "- Verify passport validity, visa rules and entry requirements.",
+            "- Confirm travel insurance and emergency contact details.",
+            "- Recheck flight, hotel and weather information before departure.",
+        ]
+    )
+
+    return "\n".join(lines)
+
+
+def build_fallback_final_plan(
+    destination: str,
+    user_query: str,
+    itinerary: str,
+) -> str:
+    """Create a presentable final response if final LLM synthesis fails."""
+    days = extract_trip_duration(user_query)
+
+    return f"""# ✈️ Your Travel Plan: {destination}
+
+## ✅ Recommended approach
+
+Use a balanced {days}-day plan with centrally located accommodation, public
+transport where practical and advance booking for major attractions.
+
+## 📌 Trip at a glance
+
+| Item | Recommendation |
+|---|---|
+| Destination | **{destination}** |
+| Duration | **{days} days** |
+| Planning style | Balanced and flexible |
+| Booking priority | Flights, accommodation and timed-entry attractions |
+| Safety margin | Keep 10–15% of the budget as contingency |
+
+## 🧭 Day-wise plan
+
+{itinerary}
+
+## ⚠️ Verify before payment
+
+1. Live flight schedule and final fare
+2. Hotel taxes, cancellation conditions and location
+3. Passport, visa and entry requirements
+4. Travel insurance
+5. Latest weather forecast
+
+## 🚀 Next actions
+
+1. Compare flight options.
+2. Shortlist accommodation in a convenient area.
+3. Reserve major attractions.
+4. Save offline copies of confirmations.
+5. Recheck weather and transport shortly before departure.
+"""
+
+
 def compact_json(value: Any, limit: int = 12_000) -> str:
     """Serialize normalized data for LLM context without exposing it to users."""
     normalized = normalize_tool_result(value)
@@ -256,30 +444,8 @@ def compact_json(value: Any, limit: int = 12_000) -> str:
 
 
 def clean_markdown(text: Any) -> str:
-    """Normalize model/tool output into clean display-ready Markdown."""
-    normalized = normalize_tool_result(text)
-
-    if isinstance(normalized, dict):
-        for key in (
-            "final_response",
-            "final_answer",
-            "travel_plan",
-            "output",
-            "answer",
-            "content",
-            "text",
-        ):
-            if normalized.get(key):
-                return clean_markdown(normalized[key])
-        value = json.dumps(normalized, ensure_ascii=False, default=str)
-    elif isinstance(normalized, list):
-        parts = [clean_markdown(item) for item in normalized]
-        value = "\n\n".join(part for part in parts if part)
-    else:
-        value = str(normalized or "")
-
-    value = value.replace("\\n", "\n").replace("\\t", " ")
-    value = value.strip()
+    """Normalize model output and remove accidental fenced wrappers."""
+    value = str(getattr(text, "content", text) or "").strip()
 
     if value.startswith("```markdown"):
         value = value[len("```markdown"):].strip()
@@ -289,7 +455,7 @@ def clean_markdown(text: Any) -> str:
     if value.endswith("```"):
         value = value[:-3].strip()
 
-    return value.strip().strip('"').strip("'")
+    return value
 
 
 def safe_number(value: Any, digits: int = 1) -> str:
@@ -333,49 +499,123 @@ def clean_location_text(location: str) -> str:
 
 
 async def extract_destination(user_query: str) -> str:
-    """Extract the primary destination from a worldwide travel request."""
+    """
+    Extract the destination without returning the entire travel request.
+
+    Deterministic parsing is attempted first so requests such as
+    ``Plan a 7-day Japan trip from Hyderabad`` resolve to ``Tokyo, Japan``
+    even when the LLM provider is temporarily unavailable.
+    """
+    query = " ".join(user_query.strip().split())
+
+    country_defaults = {
+        "japan": "Tokyo, Japan",
+        "france": "Paris, France",
+        "italy": "Rome, Italy",
+        "thailand": "Bangkok, Thailand",
+        "united arab emirates": "Dubai, United Arab Emirates",
+        "uae": "Dubai, United Arab Emirates",
+        "indonesia": "Bali, Indonesia",
+        "singapore": "Singapore",
+        "united kingdom": "London, United Kingdom",
+        "uk": "London, United Kingdom",
+        "united states": "New York, United States",
+        "usa": "New York, United States",
+        "australia": "Sydney, Australia",
+        "south korea": "Seoul, South Korea",
+        "switzerland": "Zurich, Switzerland",
+        "maldives": "Malé, Maldives",
+    }
+
+    city_aliases = {
+        "tokyo": "Tokyo, Japan",
+        "kyoto": "Kyoto, Japan",
+        "osaka": "Osaka, Japan",
+        "paris": "Paris, France",
+        "london": "London, United Kingdom",
+        "dubai": "Dubai, United Arab Emirates",
+        "rome": "Rome, Italy",
+        "bangkok": "Bangkok, Thailand",
+        "bali": "Bali, Indonesia",
+        "new york": "New York, United States",
+        "singapore": "Singapore",
+        "sydney": "Sydney, Australia",
+        "seoul": "Seoul, South Korea",
+        "cape town": "Cape Town, South Africa",
+        "visakhapatnam": "Visakhapatnam, India",
+        "hyderabad": "Hyderabad, India",
+        "bengaluru": "Bengaluru, India",
+        "bangalore": "Bengaluru, India",
+    }
+
+    lowered = query.lower()
+
+    # Prefer explicitly named destination cities.
+    for alias, resolved in city_aliases.items():
+        if re.search(rf"\b{re.escape(alias)}\b", lowered):
+            # Avoid selecting a city that is clearly the origin.
+            origin_match = re.search(
+                rf"\bfrom\s+{re.escape(alias)}\b",
+                lowered,
+            )
+            destination_match = re.search(
+                rf"\b(?:to|in|visit|trip\s+to)\s+{re.escape(alias)}\b",
+                lowered,
+            )
+
+            if destination_match or not origin_match:
+                return resolved
+
+    # Handle country-style requests such as "Japan trip from Hyderabad".
+    for country, resolved in country_defaults.items():
+        if re.search(rf"\b{re.escape(country)}\b", lowered):
+            return resolved
+
+    explicit_patterns = (
+        r"\b(?:travel|fly|go|trip)\s+to\s+([A-Za-z][A-Za-z\s,.'-]+?)(?=\s+(?:from|for|under|with|on)\b|$)",
+        r"\bto\s+([A-Za-z][A-Za-z\s,.'-]+?)(?=\s+(?:from|for|under|with|on)\b|$)",
+        r"\bin\s+([A-Za-z][A-Za-z\s,.'-]+?)(?=\s+(?:for|under|with|on)\b|$)",
+        r"\bvisit\s+([A-Za-z][A-Za-z\s,.'-]+?)(?=\s+(?:for|under|with|on)\b|$)",
+    )
+
+    for expression in explicit_patterns:
+        match = re.search(expression, query, flags=re.IGNORECASE)
+        if match:
+            candidate = clean_location_text(match.group(1))
+            if candidate and len(candidate) <= 80:
+                return candidate
+
     extraction_prompt = f"""
-Extract the main destination city and country from this travel request.
+Extract only the primary destination from the travel request below.
 
 Request:
-{user_query}
+{query}
 
-Return only one location in this format:
-City, Country
+Return only a city and country, for example:
+Tokyo, Japan
 
-Rules:
-- If both origin and destination exist, return the destination.
-- Prefer a city rather than only a country.
-- Do not add explanation or markdown.
+Never return the full request. If only a country is given, choose its most
+appropriate major tourist gateway city.
 """
 
     try:
-        response = await get_llm().ainvoke(
-            [
-                SystemMessage(
-                    content="You extract precise travel destinations."
-                ),
-                HumanMessage(content=extraction_prompt),
-            ]
+        destination = await invoke_llm_markdown(
+            "You extract one precise destination location.",
+            extraction_prompt,
+            timeout_seconds=35,
         )
-        destination = clean_location_text(clean_markdown(response))
-        if destination and len(destination) <= 100:
+        destination = clean_location_text(destination.splitlines()[0])
+
+        if destination and len(destination) <= 80:
             return destination
+
     except Exception:
         logger.warning("LLM destination extraction failed", exc_info=True)
 
-    patterns = [
-        r"\bto\s+([A-Za-z][A-Za-z\s,.'-]+?)(?:\s+from\s+|\s+for\s+|\s+under\s+|$)",
-        r"\bin\s+([A-Za-z][A-Za-z\s,.'-]+?)(?:\s+for\s+|\s+under\s+|$)",
-        r"\bvisit\s+([A-Za-z][A-Za-z\s,.'-]+?)(?:\s+for\s+|\s+under\s+|$)",
-    ]
-
-    for pattern in patterns:
-        match = re.search(pattern, user_query, flags=re.IGNORECASE)
-        if match:
-            return clean_location_text(match.group(1))
-
-    return clean_location_text(user_query[:100])
+    raise ValueError(
+        "Could not identify a destination. Include a city or country, "
+        "for example: 'Tokyo, Japan'."
+    )
 
 
 # =============================================================================
@@ -468,9 +708,23 @@ def format_weather_markdown(
     forecast_result: Any,
     destination: str,
 ) -> str:
-    """Create deterministic, attractive Markdown from weather MCP data."""
+    """Create deterministic Markdown from common OpenWeather/MCP shapes."""
     current = find_first_mapping(current_result)
     forecast_items = locate_forecast_list(forecast_result)
+
+    main_data = current.get("main") if isinstance(current.get("main"), dict) else {}
+    wind_data = current.get("wind") if isinstance(current.get("wind"), dict) else {}
+    weather_data = current.get("weather")
+
+    weather_entry: dict[str, Any] = {}
+    if (
+        isinstance(weather_data, list)
+        and weather_data
+        and isinstance(weather_data[0], dict)
+    ):
+        weather_entry = weather_data[0]
+    elif isinstance(weather_data, dict):
+        weather_entry = weather_data
 
     city = (
         current.get("city")
@@ -478,26 +732,67 @@ def format_weather_markdown(
         or current.get("name")
         or destination
     )
-    temperature = (
-        current.get("temperature_c")
-        or current.get("temperature")
-        or current.get("temp")
+
+    temperature = next(
+        (
+            value
+            for value in (
+                current.get("temperature_c"),
+                current.get("temperature"),
+                current.get("temp"),
+                main_data.get("temp"),
+            )
+            if value is not None
+        ),
+        None,
     )
-    feels_like = (
-        current.get("feels_like_c")
-        or current.get("feels_like")
+    feels_like = next(
+        (
+            value
+            for value in (
+                current.get("feels_like_c"),
+                current.get("feels_like"),
+                main_data.get("feels_like"),
+            )
+            if value is not None
+        ),
+        None,
     )
-    humidity = current.get("humidity")
-    condition = (
-        current.get("condition")
-        or current.get("weather")
-        or current.get("description")
-        or "Not available"
+    humidity = next(
+        (
+            value
+            for value in (
+                current.get("humidity"),
+                main_data.get("humidity"),
+            )
+            if value is not None
+        ),
+        None,
     )
-    wind = (
-        current.get("wind_speed")
-        or current.get("wind")
-        or current.get("wind_mps")
+    condition = next(
+        (
+            value
+            for value in (
+                current.get("condition"),
+                current.get("description"),
+                weather_entry.get("description"),
+                weather_entry.get("main"),
+            )
+            if value not in (None, "")
+        ),
+        "Not available",
+    )
+    wind = next(
+        (
+            value
+            for value in (
+                current.get("wind_speed"),
+                current.get("wind_mps"),
+                wind_data.get("speed"),
+            )
+            if value is not None
+        ),
+        None,
     )
 
     condition_text = title_case_condition(condition)
@@ -529,22 +824,54 @@ def format_weather_markdown(
         )
 
         for item in forecast_items[:8]:
+            item_main = (
+                item.get("main")
+                if isinstance(item.get("main"), dict)
+                else {}
+            )
+            item_weather = item.get("weather")
+            item_weather_entry: dict[str, Any] = {}
+
+            if (
+                isinstance(item_weather, list)
+                and item_weather
+                and isinstance(item_weather[0], dict)
+            ):
+                item_weather_entry = item_weather[0]
+            elif isinstance(item_weather, dict):
+                item_weather_entry = item_weather
+
             timestamp = (
                 item.get("datetime")
                 or item.get("date")
                 or item.get("time")
                 or item.get("dt_txt")
             )
-            item_temperature = (
-                item.get("temperature")
-                or item.get("temperature_c")
-                or item.get("temp")
+            item_temperature = next(
+                (
+                    value
+                    for value in (
+                        item.get("temperature"),
+                        item.get("temperature_c"),
+                        item.get("temp"),
+                        item_main.get("temp"),
+                    )
+                    if value is not None
+                ),
+                None,
             )
-            item_condition = (
-                item.get("weather")
-                or item.get("condition")
-                or item.get("description")
-                or "Not available"
+            item_condition = next(
+                (
+                    value
+                    for value in (
+                        item.get("condition"),
+                        item.get("description"),
+                        item_weather_entry.get("description"),
+                        item_weather_entry.get("main"),
+                    )
+                    if value not in (None, "")
+                ),
+                "Not available",
             )
             condition_label = title_case_condition(item_condition)
             lines.append(
@@ -553,28 +880,26 @@ def format_weather_markdown(
                 f"{weather_icon(condition_label)} {condition_label} |"
             )
 
-    lowered = condition_text.lower()
     recommendations: list[str] = []
+    lowered = condition_text.lower()
 
-    if "rain" in lowered or any(
-        "rain" in str(item.get("weather", "")).lower()
-        for item in forecast_items[:8]
-    ):
+    if "rain" in lowered:
         recommendations.append(
             "Carry a compact umbrella or lightweight rain jacket."
         )
-    if humidity is not None:
-        try:
-            if float(humidity) >= 70:
-                recommendations.append(
-                    "Expect humid conditions; choose breathable clothing and stay hydrated."
-                )
-        except (TypeError, ValueError):
-            pass
+
+    try:
+        if humidity is not None and float(humidity) >= 70:
+            recommendations.append(
+                "Expect humid conditions; wear breathable clothing and stay hydrated."
+            )
+    except (TypeError, ValueError):
+        pass
+
     try:
         if temperature is not None and float(temperature) >= 28:
             recommendations.append(
-                "Use sunscreen and avoid extended outdoor activity during the hottest hours."
+                "Use sunscreen and avoid prolonged outdoor activity at midday."
             )
         elif temperature is not None and float(temperature) <= 12:
             recommendations.append(
@@ -590,11 +915,10 @@ def format_weather_markdown(
 
     lines.extend(["", "### Traveller advice", ""])
     lines.extend(f"- {item}" for item in recommendations)
-
     lines.extend(
         [
             "",
-            "> Weather values are live tool data when available. "
+            "> Weather values come from the live weather tool when available. "
             "Recheck close to departure for the latest conditions.",
         ]
     )
@@ -702,71 +1026,205 @@ def build_weather_tool_input(
     user_query: str,
     destination: str,
 ) -> dict[str, Any]:
-    """Build arguments dynamically from a weather tool's schema."""
+    """Build weather arguments using only the normalized destination."""
+    del user_query
+
     schema = get_tool_schema(tool)
     properties = schema.get("properties", {})
     lookup = {str(name).lower(): name for name in properties}
 
-    for field in ("query", "prompt", "question", "request", "text"):
-        if field in lookup:
-            return {lookup[field]: user_query}
+    parts = [part.strip() for part in destination.split(",", maxsplit=1)]
+    city = parts[0]
+    country = parts[1] if len(parts) > 1 else ""
 
     for field in (
         "location",
-        "city",
         "place",
-        "city_name",
-        "location_name",
         "destination",
+        "location_name",
         "address",
     ):
         if field in lookup:
             return {lookup[field]: destination}
 
-    city_field = lookup.get("city")
-    country_field = lookup.get("country")
-
+    city_field = lookup.get("city") or lookup.get("city_name")
+    country_field = lookup.get("country") or lookup.get("country_name")
     if city_field:
-        parts = [
-            item.strip()
-            for item in destination.split(",", maxsplit=1)
-        ]
-        payload: dict[str, Any] = {city_field: parts[0]}
-        if country_field and len(parts) > 1:
-            payload[country_field] = parts[1]
+        payload: dict[str, Any] = {city_field: city}
+        if country_field and country:
+            payload[country_field] = country
         return payload
 
-    return {}
-
-
-async def invoke_flight_tool(tool: Any, user_query: str) -> Any:
-    """Invoke different AviationStack tool schemas safely."""
-    schema = get_tool_schema(tool)
-    properties = schema.get("properties", {})
-
-    if not properties:
-        return await tool.ainvoke({})
-
-    lookup = {str(name).lower(): name for name in properties}
-
-    for field in (
-        "query",
-        "prompt",
-        "request",
-        "question",
-        "route",
-        "search",
-    ):
+    for field in ("query", "prompt", "question", "request", "text"):
         if field in lookup:
-            return await tool.ainvoke({lookup[field]: user_query})
+            return {lookup[field]: destination}
 
     required = schema.get("required", [])
     if not required:
-        return await tool.ainvoke({})
+        return {"location": destination}
 
     raise ValueError(
-        f"Could not build input for flight tool '{tool.name}'."
+        "Could not build a normalized location input for weather tool "
+        f"'{getattr(tool, 'name', 'unknown')}'."
     )
+
+
+def extract_origin(user_query: str) -> str:
+    """Extract the origin following the word 'from'."""
+    match = re.search(
+        r"\bfrom\s+([A-Za-z][A-Za-z\s,.'-]+?)"
+        r"(?=\s+(?:to|for|under|with|on|during|in)\b|$)",
+        user_query,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return ""
+
+    return clean_location_text(match.group(1))
+
+
+def airport_code_for_location(location: str) -> str:
+    """Return a practical IATA gateway for common portfolio test locations."""
+    lowered = location.lower()
+    airport_codes = {
+        "hyderabad": "HYD",
+        "bengaluru": "BLR",
+        "bangalore": "BLR",
+        "visakhapatnam": "VTZ",
+        "delhi": "DEL",
+        "mumbai": "BOM",
+        "chennai": "MAA",
+        "kolkata": "CCU",
+        "tokyo": "NRT",
+        "japan": "NRT",
+        "paris": "CDG",
+        "london": "LHR",
+        "dubai": "DXB",
+        "rome": "FCO",
+        "bangkok": "BKK",
+        "bali": "DPS",
+        "singapore": "SIN",
+        "sydney": "SYD",
+        "seoul": "ICN",
+        "new york": "JFK",
+        "cape town": "CPT",
+    }
+
+    for name, code in airport_codes.items():
+        if name in lowered:
+            return code
+    return ""
+
+
+def build_flight_tool_input(
+    tool: Any,
+    user_query: str,
+    destination: str,
+) -> dict[str, Any]:
+    """Build AviationStack arguments from the tool schema."""
+    schema = get_tool_schema(tool)
+    properties = schema.get("properties", {})
+    lookup = {str(name).lower(): name for name in properties}
+    required = [str(item) for item in schema.get("required", [])]
+
+    origin = extract_origin(user_query)
+    origin_code = airport_code_for_location(origin)
+    destination_code = airport_code_for_location(destination)
+
+    payload: dict[str, Any] = {}
+
+    field_values = {
+        "query": user_query,
+        "prompt": user_query,
+        "request": user_query,
+        "question": user_query,
+        "search": user_query,
+        "route": f"{origin} to {destination}".strip(),
+        "origin": origin,
+        "from": origin,
+        "departure": origin,
+        "departure_city": origin,
+        "destination": destination,
+        "to": destination,
+        "arrival": destination,
+        "arrival_city": destination,
+        "dep_iata": origin_code,
+        "departure_iata": origin_code,
+        "origin_iata": origin_code,
+        "arr_iata": destination_code,
+        "arrival_iata": destination_code,
+        "destination_iata": destination_code,
+        "limit": 10,
+    }
+
+    for normalized_name, value in field_values.items():
+        actual_name = lookup.get(normalized_name)
+        if actual_name and value not in ("", None):
+            payload[actual_name] = value
+
+    missing_required = [
+        field
+        for field in required
+        if field not in payload
+    ]
+    if missing_required:
+        raise ValueError(
+            f"Unsupported required fields for '{getattr(tool, 'name', 'unknown')}': "
+            + ", ".join(missing_required)
+        )
+
+    return payload
+
+
+async def invoke_flight_tool(
+    tool: Any,
+    user_query: str,
+    destination: str,
+) -> Any:
+    """Invoke an AviationStack tool with schema-aware arguments."""
+    payload = build_flight_tool_input(tool, user_query, destination)
+    return await tool.ainvoke(payload)
+
+
+async def invoke_search_tool(tool: Any, query: str) -> Any:
+    """Invoke Tavily or another search tool across schema variants."""
+    schema = get_tool_schema(tool)
+    properties = schema.get("properties", {})
+    lookup = {str(name).lower(): name for name in properties}
+
+    for field in ("query", "search_query", "q", "input", "text", "prompt"):
+        if field in lookup:
+            return await tool.ainvoke({lookup[field]: query})
+
+    if not properties:
+        try:
+            return await tool.ainvoke({"query": query})
+        except Exception:
+            return await tool.ainvoke(query)
+
+    required = schema.get("required", [])
+    if not required:
+        return await tool.ainvoke({"query": query})
+
+    raise ValueError(
+        f"Could not build search input for '{getattr(tool, 'name', 'unknown')}'."
+    )
+
+
+def tool_text_is_failure(text: str) -> bool:
+    """Detect friendly MCP error Markdown so it is not treated as live data."""
+    lowered = text.lower()
+    markers = (
+        "information unavailable",
+        "service is not configured",
+        "request timed out",
+        "connection unavailable",
+        "could not connect",
+        "invalid, inactive",
+        "no live weather information",
+        "unexpected weather-service error",
+    )
+    return any(marker in lowered for marker in markers)
 
 
 # =============================================================================
@@ -970,72 +1428,99 @@ Never output JSON, code, internal state, tool names, IDs, scores or raw API data
 # =============================================================================
 
 async def flight_agent(state: TravelState) -> dict[str, Any]:
-    """Collect aviation data and produce a polished flight report."""
+    """Collect aviation data, with Tavily fallback when MCP is unavailable."""
     query = state["user_query"]
+    destination = state.get("destination") or await extract_destination(query)
     errors = list(state.get("errors", []))
 
     try:
         tool_data = await get_agent_tools()
         flight_tools = tool_data.get("flight_tools", [])
-
-        if not flight_tools:
-            raise RuntimeError("No AviationStack MCP tools were loaded.")
+        fallback_tools = tool_data.get("flight_fallback_tools", [])
 
         outputs: list[dict[str, Any]] = []
 
         for tool in flight_tools[:4]:
             tool_name = str(getattr(tool, "name", "flight_tool"))
             try:
-                result = await invoke_flight_tool(tool, query)
-                outputs.append(
-                    {
-                        "tool": tool_name,
-                        "data": normalize_tool_result(result),
-                    }
-                )
+                result = await invoke_flight_tool(tool, query, destination)
+                normalized = normalize_tool_result(result)
+                if normalized not in (None, "", [], {}):
+                    outputs.append(
+                        {
+                            "source": "AviationStack MCP",
+                            "tool": tool_name,
+                            "data": normalized,
+                        }
+                    )
             except Exception as exc:
-                logger.warning(
-                    "Flight tool %s failed: %s",
-                    tool_name,
-                    exc,
-                )
+                logger.warning("Flight tool %s failed: %s", tool_name, exc)
+
+        if not outputs and fallback_tools:
+            fallback_query = (
+                f"Current flight routes and typical fare guidance to "
+                f"{destination}. User request: {query}. "
+                "Use reputable airline and flight-search sources. "
+                "Do not claim a fare is live unless explicitly supported."
+            )
+            fallback_result = await invoke_search_tool(
+                fallback_tools[0],
+                fallback_query,
+            )
+            search_results = extract_search_results(fallback_result)
+
+            if search_results:
                 outputs.append(
                     {
-                        "tool": tool_name,
-                        "status": "unavailable",
+                        "source": "Web-search fallback",
+                        "data": [
+                            {
+                                "title": item.get("title"),
+                                "url": item.get("url"),
+                                "content": str(item.get("content") or "")[:1200],
+                            }
+                            for item in search_results[:8]
+                        ],
                     }
                 )
 
-        response = await get_llm().ainvoke(
-            [
-                SystemMessage(
-                    content=(
-                        "You turn aviation data into concise, accurate, "
-                        "traveller-friendly Markdown."
-                    )
-                ),
-                HumanMessage(
-                    content=FLIGHT_AGENT_PROMPT.format(
-                        query=query,
-                        flight_data=compact_json(outputs),
-                    )
-                ),
-            ]
+        if not outputs:
+            tool_error = tool_data.get("tool_errors", {}).get("flight")
+            raise RuntimeError(
+                tool_error
+                or "No aviation or fallback flight information was available."
+            )
+
+        flight_results = await invoke_llm_markdown(
+            (
+                "You turn aviation and travel-search data into concise, "
+                "accurate, traveller-friendly Markdown. Clearly label estimates."
+            ),
+            FLIGHT_AGENT_PROMPT.format(
+                query=query,
+                flight_data=compact_json(outputs),
+            ),
         )
-        flight_results = clean_markdown(response)
 
     except Exception as exc:
         logger.exception("Flight agent failed")
         errors.append(f"Flight Agent: {exc}")
-        flight_results = (
-            "## ✈️ Flight guidance\n\n"
-            "Live aviation information is temporarily unavailable. "
-            "The remaining agents continued building the trip.\n\n"
-            "> Compare routes and prices directly with airlines or a trusted "
-            "flight-search platform before booking."
-        )
+        flight_results = f"""## ✈️ Flight guidance to {destination}
+
+Live airline inventory could not be verified during this run.
+
+### Recommended search approach
+
+- Compare the same route on official airline websites and a trusted flight-search platform.
+- Check one-stop options as well as direct flights.
+- Compare the final total including baggage, seat selection and payment fees.
+- Avoid treating an estimated fare as a guaranteed live price.
+
+> The Hotel, Weather and Itinerary agents continued building the trip.
+"""
 
     return {
+        "destination": destination,
         "flight_results": flight_results,
         "messages": [AIMessage(content="Flight report completed.")],
         "llm_calls": state.get("llm_calls", 0) + 1,
@@ -1064,7 +1549,7 @@ async def hotel_agent(state: TravelState) -> dict[str, Any]:
             "nearby landmarks and source URL."
         )
 
-        result = await hotel_tool.ainvoke({"query": hotel_query})
+        result = await invoke_search_tool(hotel_tool, hotel_query)
         search_results = extract_search_results(result)
 
         if not search_results:
@@ -1079,7 +1564,7 @@ async def hotel_agent(state: TravelState) -> dict[str, Any]:
             for item in search_results[:8]
         ]
 
-        response = await get_llm().ainvoke(
+        response = await llm.ainvoke(
             [
                 SystemMessage(
                     content=(
@@ -1136,7 +1621,12 @@ async def hotel_agent(state: TravelState) -> dict[str, Any]:
 
 
 async def weather_agent(state: TravelState) -> dict[str, Any]:
-    """Fetch and deterministically format weather data."""
+    """
+    Fetch current weather and forecast and preserve clean MCP Markdown.
+
+    The updated weather MCP server returns ready-to-render Markdown. Older
+    dictionary responses remain supported through ``format_weather_markdown``.
+    """
     user_query = state["user_query"]
     destination = state.get("destination") or await extract_destination(user_query)
     errors = list(state.get("errors", []))
@@ -1149,7 +1639,8 @@ async def weather_agent(state: TravelState) -> dict[str, Any]:
         weather_tools = tool_data.get("weather_tools", [])
 
         if not weather_tools:
-            raise RuntimeError("No OpenWeather MCP tools were loaded.")
+            tool_error = tool_data.get("tool_errors", {}).get("weather")
+            raise RuntimeError(tool_error or "No OpenWeather MCP tools were loaded.")
 
         current_tool = find_tool(
             weather_tools,
@@ -1171,14 +1662,26 @@ async def weather_agent(state: TravelState) -> dict[str, Any]:
             keywords=("forecast",),
         )
 
+        sections: list[str] = []
+
         if current_tool:
             current_input = build_weather_tool_input(
                 current_tool,
                 user_query,
                 destination,
             )
-            if current_input:
-                current_result = await current_tool.ainvoke(current_input)
+            if not current_input:
+                raise ValueError("Could not build current-weather tool input.")
+
+            current_result = await current_tool.ainvoke(current_input)
+            current_text = extract_mcp_text(current_result)
+
+            if current_text and not tool_text_is_failure(current_text):
+                sections.append(current_text)
+            elif current_text:
+                errors.append(
+                    "Weather MCP current conditions returned an unavailable response."
+                )
 
         if forecast_tool and forecast_tool is not current_tool:
             forecast_input = build_weather_tool_input(
@@ -1186,73 +1689,96 @@ async def weather_agent(state: TravelState) -> dict[str, Any]:
                 user_query,
                 destination,
             )
+
             if forecast_input:
                 forecast_result = await forecast_tool.ainvoke(forecast_input)
+                forecast_text = extract_mcp_text(forecast_result)
 
-        if current_result is None and forecast_result is None:
-            raise RuntimeError("Weather tools returned no usable data.")
+                if forecast_text and not tool_text_is_failure(forecast_text):
+                    sections.append(forecast_text)
+                elif forecast_text:
+                    errors.append(
+                        "Weather MCP forecast returned an unavailable response."
+                    )
 
-        weather_results = format_weather_markdown(
-            current_result=current_result,
-            forecast_result=forecast_result,
-            destination=destination,
-        )
+        if not sections:
+            raise RuntimeError("Weather tools returned no readable information.")
+
+        combined = "\n\n---\n\n".join(sections).strip()
+
+        if looks_like_markdown(combined):
+            weather_results = combined
+        else:
+            weather_results = format_weather_markdown(
+                current_result=current_result,
+                forecast_result=forecast_result,
+                destination=destination,
+            )
+
+        if tool_text_is_failure(weather_results):
+            raise RuntimeError(
+                "Weather provider returned an unavailable response."
+            )
+
+        unavailable_count = weather_results.lower().count("not available")
+        if unavailable_count >= 2:
+            raise RuntimeError(
+                "Weather response did not contain enough valid measurements."
+            )
 
     except Exception as exc:
         logger.exception("Weather agent failed")
         errors.append(f"Weather Agent: {exc}")
-        weather_results = (
-            f"## 🌦️ Weather in {destination}\n\n"
-            "Live weather information is temporarily unavailable.\n\n"
-            "### Traveller advice\n\n"
-            "- Check an official weather service shortly before departure.\n"
-            "- Pack flexible layers suitable for changing conditions.\n"
-            "- Keep indoor alternatives for weather-sensitive activities."
-        )
+        weather_results = f"""## 🌦️ Weather in {destination}
+
+Live weather values could not be retrieved for this run.
+
+### 🎒 Traveller advice
+
+- Check the latest forecast shortly before departure.
+- Pack flexible layers and a compact umbrella.
+- Keep indoor alternatives for weather-sensitive activities.
+
+> The rest of the travel workflow continued normally.
+"""
 
     return {
         "destination": destination,
         "weather_results": weather_results,
         "messages": [AIMessage(content="Weather report completed.")],
-        "llm_calls": state.get("llm_calls", 0) + 1,
+        "llm_calls": state.get("llm_calls", 0),
         "errors": errors,
     }
 
 
 async def itinerary_agent(state: TravelState) -> dict[str, Any]:
-    """Combine all specialist reports into a detailed itinerary."""
+    """Combine specialist reports into a detailed, resilient itinerary."""
     errors = list(state.get("errors", []))
+    destination = state.get("destination") or "the destination"
 
     try:
-        response = await get_llm().ainvoke(
-            [
-                SystemMessage(
-                    content=(
-                        "You create realistic, structured international "
-                        "itineraries using supplied specialist reports."
-                    )
-                ),
-                HumanMessage(
-                    content=ITINERARY_PROMPT.format(
-                        user_query=state["user_query"],
-                        destination=state.get("destination", "the destination"),
-                        flight_results=state.get("flight_results", ""),
-                        hotel_results=state.get("hotel_results", ""),
-                        weather_results=state.get("weather_results", ""),
-                    )
-                ),
-            ]
+        prompt = ITINERARY_PROMPT.format(
+            user_query=state["user_query"],
+            destination=destination,
+            flight_results=state.get("flight_results", "")[:6000],
+            hotel_results=state.get("hotel_results", "")[:6000],
+            weather_results=state.get("weather_results", "")[:5000],
         )
-        itinerary = clean_markdown(response)
+
+        itinerary = await invoke_llm_markdown(
+            (
+                "You create realistic, structured international itineraries. "
+                "Return polished Markdown only."
+            ),
+            prompt,
+        )
 
     except Exception as exc:
         logger.exception("Itinerary agent failed")
         errors.append(f"Itinerary Agent: {exc}")
-        itinerary = (
-            "## 🗓️ Suggested itinerary\n\n"
-            "A detailed day-by-day itinerary could not be generated. "
-            "Use the flight, hotel and weather sections above to continue "
-            "planning manually."
+        itinerary = build_fallback_itinerary(
+            destination,
+            state["user_query"],
         )
 
     return {
@@ -1266,37 +1792,34 @@ async def itinerary_agent(state: TravelState) -> dict[str, Any]:
 async def final_agent(state: TravelState) -> dict[str, Any]:
     """Produce the polished executive summary displayed by Streamlit."""
     errors = list(state.get("errors", []))
+    destination = state.get("destination") or "the destination"
 
     try:
-        response = await get_llm().ainvoke(
-            [
-                SystemMessage(
-                    content=(
-                        "You are the final editorial and quality-control agent. "
-                        "Produce polished travel plans without raw tool output."
-                    )
-                ),
-                HumanMessage(
-                    content=FINAL_AGENT_PROMPT.format(
-                        user_query=state["user_query"],
-                        destination=state.get("destination", "the destination"),
-                        flight_results=state.get("flight_results", ""),
-                        hotel_results=state.get("hotel_results", ""),
-                        weather_results=state.get("weather_results", ""),
-                        itinerary=state.get("itinerary", ""),
-                    )
-                ),
-            ]
+        prompt = FINAL_AGENT_PROMPT.format(
+            user_query=state["user_query"],
+            destination=destination,
+            flight_results=state.get("flight_results", "")[:4500],
+            hotel_results=state.get("hotel_results", "")[:4500],
+            weather_results=state.get("weather_results", "")[:3500],
+            itinerary=state.get("itinerary", "")[:9000],
         )
-        final_response = clean_markdown(response)
+
+        final_response = await invoke_llm_markdown(
+            (
+                "You are the final editorial and quality-control agent for a "
+                "premium AI travel planner. Return polished Markdown only."
+            ),
+            prompt,
+        )
 
     except Exception as exc:
         logger.exception("Final agent failed")
         errors.append(f"Final Agent: {exc}")
-        final_response = state.get("itinerary", "") or (
-            "# ✈️ Your AI Travel Plan\n\n"
-            "The specialist reports were generated, but final synthesis "
-            "is temporarily unavailable."
+        final_response = build_fallback_final_plan(
+            destination=destination,
+            user_query=state["user_query"],
+            itinerary=state.get("itinerary", "")
+            or build_fallback_itinerary(destination, state["user_query"]),
         )
 
     return {
@@ -1331,79 +1854,6 @@ app = graph.compile(checkpointer=checkpointer)
 
 
 # =============================================================================
-# Public application entry point
-# =============================================================================
-
-async def run_travel_planner(
-    query: str,
-    thread_id: str | None = None,
-) -> str:
-    """Run the complete multi-agent workflow and return final Markdown.
-
-    This is the stable integration contract used by frontend.py, tests, and
-    future API layers. Individual tool failures are handled inside each agent,
-    so the workflow returns the best available plan whenever possible.
-    """
-    clean_query = str(query or "").strip()
-    if not clean_query:
-        raise ValueError("Travel request cannot be empty.")
-
-    request_thread_id = thread_id or str(uuid.uuid4())
-    destination = await extract_destination(clean_query)
-
-    initial_state: TravelState = {
-        "messages": [HumanMessage(content=clean_query)],
-        "user_query": clean_query,
-        "destination": destination,
-        "flight_results": "",
-        "hotel_results": "",
-        "weather_results": "",
-        "itinerary": "",
-        "final_response": "",
-        "llm_calls": 0,
-        "errors": [],
-    }
-
-    config = {"configurable": {"thread_id": request_thread_id}}
-
-    try:
-        result = await app.ainvoke(initial_state, config=config)
-    except Exception as exc:
-        logger.exception("Travel planner workflow failed")
-        raise RuntimeError(
-            "The travel workflow could not start. Verify GROQ_API_KEY and "
-            "the installed LangGraph/LangChain dependencies. "
-            f"Technical cause: {exc}"
-        ) from exc
-
-    final_response = clean_markdown(
-        result.get("final_response")
-        or result.get("itinerary")
-        or result.get("hotel_results")
-        or result.get("flight_results")
-        or result.get("weather_results")
-    )
-
-    if not final_response:
-        warnings = result.get("errors", [])
-        warning_text = "; ".join(str(item) for item in warnings)
-        raise RuntimeError(
-            "The workflow completed without a displayable travel plan."
-            + (f" Non-fatal agent warnings: {warning_text}" if warning_text else "")
-        )
-
-    return final_response
-
-
-def run_travel_planner_sync(
-    query: str,
-    thread_id: str | None = None,
-) -> str:
-    """Synchronous convenience wrapper for scripts and simple clients."""
-    return asyncio.run(run_travel_planner(query, thread_id=thread_id))
-
-
-# =============================================================================
 # Command-line test
 # =============================================================================
 
@@ -1420,15 +1870,34 @@ async def command_line_test() -> None:
         print("Travel request cannot be empty.")
         return
 
-    result = await run_travel_planner(
-        user_input,
-        thread_id=config["configurable"]["thread_id"],
-    )
+    destination = await extract_destination(user_input)
+
+    initial_state: TravelState = {
+        "messages": [HumanMessage(content=user_input)],
+        "user_query": user_input,
+        "destination": destination,
+        "flight_results": "",
+        "hotel_results": "",
+        "weather_results": "",
+        "itinerary": "",
+        "final_response": "",
+        "llm_calls": 0,
+        "errors": [],
+    }
+
+    result = await app.ainvoke(initial_state, config=config)
 
     print("\n" + "=" * 80)
     print("FINAL TRAVEL PLAN")
     print("=" * 80 + "\n")
-    print(result)
+    print(result.get("final_response", result.get("itinerary", "")))
+
+    if result.get("errors"):
+        print("\n" + "-" * 80)
+        print("NON-FATAL AGENT WARNINGS")
+        print("-" * 80)
+        for error in result["errors"]:
+            print(f"- {error}")
 
 
 if __name__ == "__main__":

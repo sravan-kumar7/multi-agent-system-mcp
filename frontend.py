@@ -1,3 +1,6 @@
+
+from __future__ import annotations
+
 import asyncio
 import html
 import os
@@ -6,23 +9,63 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-
 import streamlit as st
 from langchain_core.messages import HumanMessage
-
-from main import app
 
 
 # =============================================================================
 # Page configuration
 # =============================================================================
 
+# This must be the first Streamlit command in the script.
 st.set_page_config(
     page_title="AI Travel Booking System",
     page_icon="✈️",
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+
+# =============================================================================
+# Streamlit secrets and application import
+# =============================================================================
+
+SECRET_ALIASES = {
+    "GROQ_API_KEY": ("GROQ_API_KEY",),
+    "GROQ_MODEL": ("GROQ_MODEL",),
+    "TAVILY_API_KEY": ("TAVILY_API_KEY",),
+    "OPENWEATHER_API_KEY": (
+        "OPENWEATHER_API_KEY",
+        "OPEN_WEATHER_API_KEY",
+    ),
+    "AVIATION_STACK_API_KEY": (
+        "AVIATION_STACK_API_KEY",
+        "AVIATIONSTACK_API_KEY",
+    ),
+}
+
+
+def copy_streamlit_secrets_to_environment() -> None:
+    """Copy configured Streamlit secrets into process environment variables."""
+    for canonical_name, aliases in SECRET_ALIASES.items():
+        if os.getenv(canonical_name):
+            continue
+
+        for alias in aliases:
+            try:
+                secret_value = st.secrets.get(alias)
+            except Exception:
+                secret_value = None
+
+            if secret_value:
+                os.environ[canonical_name] = str(secret_value).strip()
+                break
+
+
+copy_streamlit_secrets_to_environment()
+
+# Import only after API keys are available in the process environment.
+from main import app  # noqa: E402
 
 
 # =============================================================================
@@ -81,6 +124,7 @@ def initialize_session_state() -> None:
         "travel_query": "",
         "last_result": None,
         "last_error": None,
+        "last_query": "",
     }
 
     for key, value in defaults.items():
@@ -486,18 +530,30 @@ def run_travel_graph(
     initial_state: dict[str, Any],
     config: dict[str, Any],
 ) -> dict[str, Any]:
-    """
-    Run the asynchronous graph from Streamlit.
-
-    Streamlit normally executes the script without an active event loop, so
-    asyncio.run is appropriate both locally and on Streamlit Community Cloud.
-    """
-    return asyncio.run(
-        invoke_travel_graph(
-            initial_state=initial_state,
-            config=config,
+    """Run the asynchronous graph safely from Streamlit."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(
+            invoke_travel_graph(
+                initial_state=initial_state,
+                config=config,
+            )
         )
-    )
+
+    # A running event loop is uncommon in Streamlit, but can occur in some
+    # hosted runtimes. Execute the graph in a dedicated worker thread.
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(
+            asyncio.run,
+            invoke_travel_graph(
+                initial_state=initial_state,
+                config=config,
+            ),
+        )
+        return future.result()
 
 
 def create_markdown_plan(
@@ -604,6 +660,8 @@ with st.sidebar:
     if st.button("Create new session", use_container_width=True):
         st.session_state.thread_id = f"traveler_{uuid.uuid4().hex[:8]}"
         st.session_state.last_result = None
+        st.session_state.last_error = None
+        st.session_state.last_query = ""
         st.session_state.travel_query = ""
         st.rerun()
 
@@ -765,6 +823,8 @@ if generate:
         }
 
         st.session_state.last_error = None
+        st.session_state.last_result = None
+        st.session_state.last_query = user_query
 
         with st.status(
             "Running the asynchronous multi-agent workflow...",
@@ -788,20 +848,20 @@ if generate:
                     expanded=False,
                 )
             except Exception as exc:
-                st.session_state.last_error = str(exc)
+                st.session_state.last_error = (
+                    f"{type(exc).__name__}: {str(exc).strip()}"
+                )
                 workflow_status.update(
                     label="The workflow encountered an error",
                     state="error",
-                    expanded=True,
+                    expanded=False,
                 )
 
         if st.session_state.last_error:
             st.error(
-                "The graph could not complete. Verify your API keys, MCP server "
-                "configuration and application logs."
+                "The travel workflow could not complete. Check the terminal or "
+                "Streamlit Cloud logs for the detailed cause."
             )
-            with st.expander("Technical error details"):
-                st.code(st.session_state.last_error)
 
 
 # =============================================================================
@@ -909,6 +969,17 @@ if st.session_state.last_result:
     render_result_section("Weather information", "🌦️", weather_results)
     render_result_section("Day-wise itinerary", "🗓️", itinerary)
 
+    non_fatal_errors = result.get("errors") or []
+    if non_fatal_errors:
+        with st.expander("Workflow diagnostics", expanded=False):
+            st.caption(
+                "The plan completed, but one or more agents used a fallback."
+            )
+            for warning in non_fatal_errors:
+                label = str(warning).split(":", maxsplit=1)[0].strip()
+                if label:
+                    st.write(f"• {label} used fallback handling.")
+
     st.markdown(
         "<div class='section-title'>Final travel plan</div>",
         unsafe_allow_html=True,
@@ -923,7 +994,7 @@ if st.session_state.last_result:
         )
 
     filename, file_content = create_markdown_plan(
-        user_query=st.session_state.travel_query,
+        user_query=st.session_state.last_query or st.session_state.travel_query,
         thread_id=st.session_state.thread_id,
         flight_results=flight_results,
         hotel_results=hotel_results,
@@ -933,7 +1004,7 @@ if st.session_state.last_result:
         llm_calls=llm_calls,
     )
 
-    saved, save_message = save_plan_locally(filename, file_content)
+    saved, _save_message = save_plan_locally(filename, file_content)
 
     download_column, save_column = st.columns([1, 2])
     with download_column:
